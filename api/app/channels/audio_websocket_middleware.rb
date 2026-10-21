@@ -121,7 +121,21 @@ class AudioWebSocketMiddleware
     state.last_coverage_digest = injector.coverage_fingerprint
 
     build_gemini_client(browser_ws, state)
-    state.gemini_client.connect(resumption_handle: session.gemini_resumption_token.presence)
+
+    # ── SAFEGUARD FOR WINDOWS SSL / EVENTMACHINE CRASH ──────────────────────
+    begin
+      state.gemini_client.connect(resumption_handle: session.gemini_resumption_token.presence)
+    rescue StandardError, Exception => e
+      Rails.logger.error "[WebSocketMiddleware] Failed to connect Gemini SSL: #{e.class} - #{e.message}"
+
+      # Kirim error JSON yang rapi ke frontend agar tidak terputus tanpa kejelasan
+      send_json(browser_ws, 
+        type: 'error', 
+        code: 'gemini_connection_failed',
+        message: 'AI Voice engine unavailable on host (Windows SSL Extension Issue). Please use mock response or Linux/Docker runner.',
+        recoverable: true
+      )
+    end
   end
 
   def ensure_system_prompt(session)
@@ -133,8 +147,15 @@ class AudioWebSocketMiddleware
     end
   end
 
-  def build_gemini_client(browser_ws, state)
+ def build_gemini_client(browser_ws, state)
     session = state.session
+
+    # ── FORCE MOCK MODE IN DEVELOPMENT TO PREVENT EVENTMACHINE SSL CRASH ─────
+    if Rails.env.development? && ENV['FORCE_LIVE_GEMINI'] != 'true'
+      Rails.logger.warn("[AudioWS] Development environment detected. Using MockGeminiClient to bypass EventMachine C-extension SSL crash.")
+      state.gemini_client = MockGeminiClient.new(browser_ws, state)
+      return
+    end
 
     state.gemini_client = Gemini::LiveClient.new(
       system_prompt: session.assessment.system_prompt,
@@ -800,4 +821,48 @@ class AudioWebSocketMiddleware
       @turn_counter += 1
     end
   end
+
+  class MockGeminiClient
+  def initialize(browser_ws, state)
+    @browser_ws = browser_ws
+    @state = state
+  end
+
+  def connect(resumption_handle: nil)
+    Rails.logger.info("[MockGeminiClient] Connected successfully in Windows Fallback Mode.")
+
+    # 1. Kirim event bahwa sesi siap (mengubah UI dari "Connecting..." ke Active)
+    EM.add_timer(0.2) do
+      send_json({ type: "session_started" })
+      send_json({ type: "state_changed", state: "active" })
+      send_json({ type: "speaker_changed", speaker: "ai" })
+    end
+
+    # 2. Kirim salam & pertanyaan pertama dari AI
+    EM.add_timer(1.0) do
+      send_json({
+        type: "transcript",
+        speaker: "ai",
+        text: "Halo! Selamat datang di wawancara AI. Bisakah Anda menceritakan pengalaman Anda terkait role ini?"
+      })
+      # Setelah AI selesai bicara, berikan giliran ke kandidat
+      send_json({ type: "speaker_changed", speaker: "candidate" })
+    end
+  end
+
+  def send_audio(chunk)
+    # Mock penerimaan audio kandidat
+  end
+
+  def close
+    Rails.logger.info("[MockGeminiClient] Connection closed.")
+  end
+
+  private
+
+  def send_json(payload)
+    return unless @browser_ws
+    @browser_ws.send(payload.to_json)
+  end
+end
 end

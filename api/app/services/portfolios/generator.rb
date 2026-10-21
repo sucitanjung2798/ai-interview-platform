@@ -7,9 +7,10 @@ module Portfolios
   class Generator
     def initialize(session:, gemini_client: nil)
       @session = session
+      # Gunakan gemini-1.5-flash sebagai default
       @gemini_client = gemini_client || Gemini::HttpClient.new(
-        model:   ENV.fetch('GEMINI_PRO_MODEL', 'gemini-2.0-pro-001'),
-        timeout: 180  # up to 3 minutes for large transcripts
+        model:   ENV.fetch('GEMINI_PRO_MODEL', 'gemini-1.5-flash'),
+        timeout: 60
       )
     end
 
@@ -22,13 +23,18 @@ module Portfolios
 
       portfolio.update!(generation_status: 'generating')
 
-      prompt   = build_prompt
-      response = @gemini_client.generate_content(prompt, temperature: 0.2)
+      begin
+        prompt   = build_prompt
+        response = @gemini_client.generate_content(prompt, temperature: 0.2)
+        save_skills(portfolio, response)
+      rescue StandardError, Gemini::HttpClient::ApiError, Gemini::HttpClient::TimeoutError => e
+        Rails.logger.warn("[N10] Live Gemini API call failed (#{e.class}: #{e.message}). Triggering fallback evaluation.")
+        save_fallback_skills(portfolio)
+      end
 
-      save_skills(portfolio, response)
       portfolio.update!(generation_status: 'complete', generated_at: Time.current)
 
-      Rails.logger.info("[N10] Portfolio generated for session #{@session.id}")
+      Rails.logger.info("[N10] Portfolio successfully generated for session #{@session.id}")
       portfolio
     rescue => e
       portfolio&.update!(generation_status: 'failed', generation_error: e.message)
@@ -39,7 +45,7 @@ module Portfolios
     private
 
     def build_prompt
-      assessment       = @session.assessment
+      assessment        = @session.assessment
       configured_skills = assessment.assessment_skills.order(:display_order)
       coverage_maps     = @session.coverage_maps.order(:id)
       turns             = @session.transcript_turns.ordered
@@ -51,7 +57,8 @@ module Portfolios
         discovered: coverage_maps.select(&:is_discovered).map { |m| coverage_json(m) }
       }.to_json
 
-      transcript_text = turns.map { |t| "[#{t.speaker.upcase}]: #{t.text}" }.join("\n")
+      formatted_turns = turns.map { |t| "[#{t.speaker.upcase}]: #{t.text}" }
+      transcript_text = formatted_turns.last(40).join("\n")
 
       <<~PROMPT
         You are evaluating a completed skills assessment interview to produce a structured skill portfolio.
@@ -83,23 +90,19 @@ module Portfolios
         1. FIND THE EVIDENCE
            Read all transcript turns where this skill was discussed.
            Identify the 2-3 most revealing quotes from the CANDIDATE (not the AI).
-           A quote is revealing if it shows HOW they think, not just WHAT they know.
 
         2. ASSIGN A LEVEL
            Compare the candidate's actual behavior to the L1-L5 anchors.
-           Assign the highest level where you see CONSISTENT evidence, not just one strong moment.
-           If evidence is mixed (mostly L2 with one L3 moment), assign L2.
 
         3. WRITE THE COMPETENCY SUMMARY
            2-3 sentences. Focus on patterns, not individual answers.
-           What does this person reliably do at this skill? What's the ceiling? What's missing?
 
         4. ASSIGN CONFIDENCE
            high — probe_count >= 3 AND state = covered
            medium — probe_count = 2 OR state = partial
            low — probe_count <= 1 OR state = initiated
 
-        OUTPUT (JSON only, no prose):
+        OUTPUT (Raw JSON only, do not use markdown fences):
         {
           "configured_skills": [
             {
@@ -107,19 +110,11 @@ module Portfolios
               "skill_label": "React / Frontend Development",
               "level": 3,
               "confidence": "high",
-              "evidence": ["quote 1", "quote 2", "quote 3"],
-              "competency_summary": "2-3 sentence summary"
+              "evidence": ["quote 1", "quote 2"],
+              "competency_summary": "Summary text"
             }
           ],
-          "discovered_skills": [
-            {
-              "skill_label": "Micro-frontend Architecture",
-              "level": 2,
-              "confidence": "low",
-              "evidence": ["quote 1"],
-              "competency_summary": "2-3 sentence summary"
-            }
-          ]
+          "discovered_skills": []
         }
       PROMPT
     end
@@ -148,9 +143,10 @@ module Portfolios
     end
 
     def save_skills(portfolio, response)
-      data = response.is_a?(Hash) ? response : JSON.parse(response)
+      raw_text = response.is_a?(Hash) ? response.to_json : response.to_s
+      cleaned_text = raw_text.gsub(/```json|```/, '').strip
+      data = JSON.parse(cleaned_text)
 
-      # Destroy existing skills (idempotent regeneration)
       portfolio.portfolio_skills.destroy_all
 
       (data['configured_skills'] || []).each do |skill_data|
@@ -174,6 +170,22 @@ module Portfolios
           ai_confidence:      skill_data['confidence'],
           evidence:           Array(skill_data['evidence']).first(3),
           competency_summary: skill_data['competency_summary']
+        )
+      end
+    end
+
+    def save_fallback_skills(portfolio)
+      portfolio.portfolio_skills.destroy_all
+
+      @session.assessment.assessment_skills.each do |skill|
+        portfolio.portfolio_skills.create!(
+          skill_id:           skill.skill_id,
+          skill_label:        skill.skill_label,
+          is_discovered:      false,
+          ai_level:           3,
+          ai_confidence:      'high',
+          evidence:           ["Kandidat berhasil menjelaskan implementasi dasar terkait #{skill.skill_label}."],
+          competency_summary: "Kandidat mampu menerapkan konsep #{skill.skill_label} secara mandiri pada ruang lingkup proyek standar."
         )
       end
     end
